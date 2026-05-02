@@ -1,12 +1,14 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/lib/context/AuthContext";
 
 export default function AuthCallbackPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { signIn } = useAuth();
+  const { signIn, isAuthenticated } = useAuth();
+  const [hasError, setHasError] = useState(false);
 
+  // Step 1: process tokens from URL and call signIn
   useEffect(() => {
     const accessToken = searchParams.get("accessToken");
     const refreshToken = searchParams.get("refreshToken");
@@ -22,10 +24,21 @@ export default function AuthCallbackPage() {
       localStorage.setItem("google_access_token", googleAccessToken);
     }
 
-    signIn({ accessToken, refreshToken }).then(() => {
-      navigate("/dashboard", { replace: true });
-    });
+    signIn({ accessToken, refreshToken }).catch(() => setHasError(true));
   }, [searchParams, signIn, navigate]);
+
+  // Step 2: navigate AFTER React has committed isAuthenticated = true
+  useEffect(() => {
+    if (isAuthenticated) {
+      navigate("/dashboard", { replace: true });
+    }
+  }, [isAuthenticated, navigate]);
+
+  useEffect(() => {
+    if (hasError) {
+      navigate("/login?error=google_failed", { replace: true });
+    }
+  }, [hasError, navigate]);
 
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center">
