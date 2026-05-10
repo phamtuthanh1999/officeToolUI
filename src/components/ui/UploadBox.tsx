@@ -1,4 +1,4 @@
-import { useCallback, useState, useRef } from "react";
+import { useCallback, useState, useRef, useEffect } from "react";
 import { UploadCloud, File, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -21,7 +21,19 @@ export default function UploadBox({
 }: UploadBoxProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<(string | null)[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Tạo / huỷ object URL khi danh sách file thay đổi
+  useEffect(() => {
+    const urls = files.map((f) =>
+      f.type.startsWith("image/") ? URL.createObjectURL(f) : null
+    );
+    setPreviews(urls);
+    return () => {
+      urls.forEach((u) => { if (u) URL.revokeObjectURL(u); });
+    };
+  }, [files]);
 
   const handleFiles = useCallback(
     (incoming: FileList | null) => {
@@ -114,9 +126,18 @@ export default function UploadBox({
               key={i}
               className="flex items-center gap-3 p-3 bg-white border border-gray-200 rounded-xl"
             >
-              <div className="w-9 h-9 bg-orange-100 rounded-lg flex items-center justify-center shrink-0">
-                <File className="h-4 w-4 text-[#ff7a18]" />
-              </div>
+              {/* Thumbnail nếu là ảnh, icon file nếu không phải */}
+              {previews[i] ? (
+                <img
+                  src={previews[i]!}
+                  alt={file.name}
+                  className="w-10 h-10 rounded-lg object-cover shrink-0 border border-gray-100"
+                />
+              ) : (
+                <div className="w-10 h-10 bg-orange-100 rounded-lg flex items-center justify-center shrink-0">
+                  <File className="h-5 w-5 text-[#ff7a18]" />
+                </div>
+              )}
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-gray-700 truncate">{file.name}</p>
                 <p className="text-xs text-gray-400">{formatSize(file.size)}</p>

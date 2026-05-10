@@ -9,6 +9,8 @@ import UploadBox from "@/components/ui/UploadBox";
 import AuthGuard from "@/components/auth/AuthGuard";
 import { useAuth } from "@/lib/context/AuthContext";
 import { cn } from "@/lib/utils";
+import { downloadBlob } from "@/lib/api";
+import { convertFiles as convertFilesApi, buildResultFilename } from "@/lib/services/convert.service";
 
 const FORMAT_GROUPS = [
   { group: "Tài liệu", formats: ["PDF", "DOCX", "DOC", "TXT", "RTF", "ODT"] },
@@ -29,6 +31,10 @@ function ConvertContent() {
   const [targetFormat, setTargetFormat] = useState("");
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [stage, setStage] = useState<Stage>("idle");
+  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
+  const [resultFilename, setResultFilename] = useState("");
+  const [error, setError] = useState("");
+  const [uploadKey, setUploadKey] = useState(0);
 
   const handleFiles = (f: File[]) => {
     setFiles(f);
@@ -37,16 +43,30 @@ function ConvertContent() {
   };
 
   const handleConvert = async () => {
-    if (!targetFormat) return;
+    if (!canConvert) return;
     setStage("converting");
-    await new Promise((r) => setTimeout(r, 2200));
-    setStage("done");
+    setError("");
+    try {
+      const blob = await convertFilesApi(files, targetFormat);
+      setResultBlob(blob);
+      setResultFilename(buildResultFilename(files, targetFormat));
+      setStage("done");
+      // Xoá file đã chọn — tăng key để remount UploadBox
+      setFiles([]);
+      setUploadKey((k) => k + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Có lỗi xảy ra khi chuyển đổi.");
+      setStage("ready");
+    }
   };
 
   const handleReset = () => {
     setFiles([]);
     setTargetFormat("");
     setStage("idle");
+    setResultBlob(null);
+    setResultFilename("");
+    setError("");
   };
 
   const canConvert = files.length > 0 && targetFormat !== "";
@@ -97,6 +117,7 @@ function ConvertContent() {
         <Card>
           <h2 className="text-sm font-semibold text-gray-700 mb-4">Bước 1: Chọn file cần convert</h2>
           <UploadBox
+            key={uploadKey}
             multiple
             onFilesChange={handleFiles}
             maxSize={50}
@@ -169,7 +190,11 @@ function ConvertContent() {
               </p>
             </div>
             <div className="flex gap-3">
-              <Button size="lg">
+              <Button
+                size="lg"
+                onClick={() => resultBlob && downloadBlob(resultBlob, resultFilename)}
+                disabled={!resultBlob}
+              >
                 <Download className="h-4 w-4" /> Tải về tất cả
               </Button>
               <Button variant="secondary" onClick={handleReset}>
@@ -179,20 +204,27 @@ function ConvertContent() {
           </Card>
         ) : (
           stage !== "idle" && (
-            <div className="flex gap-3">
-              <Button
-                size="lg"
-                onClick={handleConvert}
-                loading={stage === "converting"}
-                disabled={!canConvert || stage === "converting"}
-                className="flex-1 sm:flex-none"
-              >
-                <RefreshCw className="h-4 w-4" />
-                {stage === "converting" ? "Đang convert..." : "Bắt đầu convert"}
-              </Button>
-              <Button variant="secondary" onClick={handleReset}>
-                <RotateCcw className="h-4 w-4" /> Làm lại
-              </Button>
+            <div className="flex flex-col gap-2">
+              {error && (
+                <div className="px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+                  {error}
+                </div>
+              )}
+              <div className="flex gap-3">
+                <Button
+                  size="lg"
+                  onClick={handleConvert}
+                  loading={stage === "converting"}
+                  disabled={!canConvert || stage === "converting"}
+                  className="flex-1 sm:flex-none"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  {stage === "converting" ? "Đang convert..." : "Bắt đầu convert"}
+                </Button>
+                <Button variant="secondary" onClick={handleReset}>
+                  <RotateCcw className="h-4 w-4" /> Làm lại
+                </Button>
+              </div>
             </div>
           )
         )}
