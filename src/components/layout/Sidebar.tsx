@@ -1,13 +1,13 @@
 import { Link, useLocation } from "react-router-dom";
 import { useAuth } from "@/lib/context/AuthContext";
 import {
-  LayoutDashboard, ImageMinus, RefreshCw, FileText, History, Settings, Zap, LogOut,
+  LayoutDashboard, Maximize2, RefreshCw, FileText, History, Settings, Zap, LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
-  { href: "/remove-bg", icon: ImageMinus, label: "Xóa nền ảnh" },
+  { href: "/resize", icon: Maximize2, label: "Thay đổi size ảnh" },
   { href: "/convert", icon: RefreshCw, label: "Convert file" },
   { href: "/pdf-tools", icon: FileText, label: "PDF Tools" },
   { href: "/history", icon: History, label: "Lịch sử" },

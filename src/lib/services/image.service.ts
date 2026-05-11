@@ -17,3 +17,25 @@ export async function removeBackgroundBulk(imageFiles: File[]): Promise<Blob> {
     body: form,
   });
 }
+
+export interface ResizeOptions {
+  width?: number;
+  height?: number;
+  format?: "jpeg" | "png" | "webp";
+  fit?: "cover" | "contain" | "fill" | "inside" | "outside";
+  quality?: number;
+}
+
+export async function resizeImage(imageFile: File, options: ResizeOptions): Promise<Blob> {
+  const form = new FormData();
+  form.append("image", imageFile);
+  if (options.width !== undefined) form.append("width", String(options.width));
+  if (options.height !== undefined) form.append("height", String(options.height));
+  if (options.format) form.append("format", options.format);
+  if (options.fit) form.append("fit", options.fit);
+  if (options.quality !== undefined) form.append("quality", String(options.quality));
+  return apiFetch<Blob>("/image/resize", {
+    method: "POST",
+    body: form,
+  });
+}

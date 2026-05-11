@@ -11,8 +11,10 @@
   "dependencies": {
     "clsx": "^2.1.1",
     "lucide-react": "^0.379.0",
+    "pdfjs-dist": "^5.7.284",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-pdf": "^10.4.1",
     "react-router-dom": "^6.24.0",
     "tailwind-merge": "^2.3.0"
   },

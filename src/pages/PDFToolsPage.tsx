@@ -1,8 +1,12 @@
-﻿import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   FileText, Scissors, PenTool, Download, X, CheckCircle,
   ArrowUp, ArrowDown, Loader2, AlertCircle, Image as ImageIcon,
+  Trash2, RotateCcw, ChevronLeft, ChevronRight, Move,
 } from "lucide-react";
+import { Document, Page, pdfjs } from "react-pdf";
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
 import AppLayout from "@/components/layout/AppLayout";
 import Card from "@/components/ui/Card";
 import Button from "@/components/ui/Button";
@@ -11,7 +15,14 @@ import AuthGuard from "@/components/auth/AuthGuard";
 import { useAuth } from "@/lib/context/AuthContext";
 import { downloadBlob } from "@/lib/api";
 import { convertFiles as convertFilesApi } from "@/lib/services/convert.service";
+import { signPdf } from "@/lib/services/pdf.service";
 import { cn } from "@/lib/utils";
+
+// Setup pdf.js worker — must use react-pdf's own bundled pdfjs-dist to avoid version mismatch
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  "react-pdf/node_modules/pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url
+).toString();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type ItemStatus = "idle" | "converting" | "done" | "error";
@@ -31,7 +42,7 @@ type TabId = "img2pdf" | "split" | "sign";
 const tabs: { id: TabId; label: string; icon: React.ElementType; desc: string; disabled?: boolean }[] = [
   { id: "img2pdf", label: "Ảnh → PDF", icon: ImageIcon, desc: "Chuyển từng ảnh thành file PDF riêng" },
   { id: "split",   label: "Tách PDF",  icon: Scissors,  desc: "Chia PDF thành nhiều file nhỏ hơn",  disabled: true },
-  { id: "sign",    label: "Ký PDF",    icon: PenTool,   desc: "Thêm chữ ký số vào tài liệu",        disabled: true },
+  { id: "sign",    label: "Ký PDF",    icon: PenTool,   desc: "Thêm chữ ký số vào tài liệu" },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -330,70 +341,588 @@ function SplitTab() {
   );
 }
 
-// ─── SignTab (placeholder) ────────────────────────────────────────────────────
+// ─── SignTab ──────────────────────────────────────────────────────────────────
+type SignType = "text" | "draw" | "upload";
+
+// A4 width in points (pdf-lib native unit)
+const PDF_A4_WIDTH_PT = 595;
+
+/** Render text to an off-screen canvas and return a PNG blob */
+async function textToBlob(text: string, fontSize: number, color: string): Promise<Blob> {
+  const padding = 16;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d")!;
+  const font = `italic ${fontSize}px "Brush Script MT", "Dancing Script", cursive, sans-serif`;
+  ctx.font = font;
+  const metrics = ctx.measureText(text);
+  canvas.width = Math.ceil(metrics.width) + padding * 2;
+  canvas.height = Math.ceil(fontSize * 1.5) + padding;
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, padding, canvas.height / 2);
+  return new Promise((res) => canvas.toBlob((b) => res(b!), "image/png"));
+}
+
+// ─── PDF Page Viewer with draggable signature overlay ────────────────────────
+interface SigPos { xPct: number; yPct: number }
+
+function PdfSignViewer({
+  fileUrl, numPages, viewPage, onPageChange,
+  sigPreviewUrl, sigPos, onSigMove, sigDisplayWidth, containerWidth, onContainerWidth,
+}: {
+  fileUrl: string; numPages: number; viewPage: number;
+  onPageChange: (p: number) => void;
+  sigPreviewUrl: string | null; sigPos: SigPos | null;
+  onSigMove: (pos: SigPos) => void;
+  sigDisplayWidth: number; containerWidth: number;
+  onContainerWidth: (w: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+  const dragOffset = useRef({ dx: 0, dy: 0 });
+  // Track rendered sig height for centered click-to-place
+  const [sigNaturalRatio, setSigNaturalRatio] = useState(0.35); // height/width, updated on img load
+
+  // Measure container width for responsive PDF scaling
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver((entries) => {
+      onContainerWidth(Math.floor(entries[0].contentRect.width));
+    });
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [onContainerWidth]);
+
+  // Click on PDF to place signature — centered at click point
+  const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isDragging.current || !sigPreviewUrl) return;
+    const rect = containerRef.current!.getBoundingClientRect();
+    const sigH = sigDisplayWidth * sigNaturalRatio;
+    onSigMove({
+      xPct: Math.max(0, Math.min(1 - sigDisplayWidth / rect.width, (e.clientX - rect.left - sigDisplayWidth / 2) / rect.width)),
+      yPct: Math.max(0, Math.min(1 - sigH / rect.height, (e.clientY - rect.top - sigH / 2) / rect.height)),
+    });
+  };
+
+  // Drag signature overlay
+  const handleSigPointerDown = (e: React.PointerEvent<HTMLImageElement>) => {
+    e.stopPropagation();
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    isDragging.current = true;
+    const rect = containerRef.current!.getBoundingClientRect();
+    // dragOffset = pointer position relative to the sig's top-left corner (in pixels)
+    dragOffset.current = {
+      dx: e.clientX - rect.left - (sigPos?.xPct ?? 0) * rect.width,
+      dy: e.clientY - rect.top  - (sigPos?.yPct ?? 0) * rect.height,
+    };
+  };
+  const handleSigPointerMove = (e: React.PointerEvent<HTMLImageElement>) => {
+    if (!isDragging.current) return;
+    const rect = containerRef.current!.getBoundingClientRect();
+    const sigH = sigDisplayWidth * sigNaturalRatio;
+    onSigMove({
+      xPct: Math.max(0, Math.min(1 - sigDisplayWidth / rect.width, (e.clientX - rect.left - dragOffset.current.dx) / rect.width)),
+      yPct: Math.max(0, Math.min(1 - sigH / rect.height, (e.clientY - rect.top  - dragOffset.current.dy) / rect.height)),
+    });
+  };
+  const handleSigPointerUp = () => { isDragging.current = false; };
+
+  const containerH = containerRef.current?.offsetHeight ?? 0;
+  const sigLeft = (sigPos?.xPct ?? 0) * containerWidth;
+  const sigTop  = (sigPos?.yPct ?? 0) * containerH;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {/* Page navigation */}
+      <div className="flex items-center justify-between px-1">
+        <span className="text-xs font-semibold text-gray-500">
+          Trang {viewPage} / {numPages}
+        </span>
+        <div className="flex gap-1">
+          <button onClick={() => onPageChange(Math.max(1, viewPage - 1))} disabled={viewPage <= 1}
+            className="p-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 disabled:opacity-30 transition-colors">
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <button onClick={() => onPageChange(Math.min(numPages, viewPage + 1))} disabled={viewPage >= numPages}
+            className="p-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 disabled:opacity-30 transition-colors">
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* PDF canvas + sig overlay */}
+      <div
+        ref={containerRef}
+        onClick={handleContainerClick}
+        className={cn(
+          "relative w-full rounded-xl overflow-hidden border border-gray-200 bg-gray-100 select-none",
+          sigPreviewUrl && !sigPos ? "cursor-crosshair" : "cursor-default"
+        )}
+      >
+        {containerWidth > 0 && (
+          <Document file={fileUrl} loading={
+            <div className="flex items-center justify-center h-64">
+              <Loader2 className="h-6 w-6 text-gray-400 animate-spin" />
+            </div>
+          }>
+            <Page
+              pageNumber={viewPage}
+              width={containerWidth}
+              renderTextLayer={false}
+              renderAnnotationLayer={false}
+            />
+          </Document>
+        )}
+
+        {/* Signature overlay */}
+        {sigPreviewUrl && sigPos && (
+          <img
+            src={sigPreviewUrl}
+            alt="Signature preview"
+            draggable={false}
+            onLoad={(e) => {
+              const img = e.target as HTMLImageElement;
+              if (img.naturalWidth > 0) setSigNaturalRatio(img.naturalHeight / img.naturalWidth);
+            }}
+            onPointerDown={handleSigPointerDown}
+            onPointerMove={handleSigPointerMove}
+            onPointerUp={handleSigPointerUp}
+            onClick={(e) => e.stopPropagation()} // ← prevent post-drag click from re-placing sig
+            style={{
+              position: "absolute",
+              left: sigLeft,
+              top: sigTop,
+              width: sigDisplayWidth,
+              cursor: isDragging.current ? "grabbing" : "grab",
+              userSelect: "none",
+              opacity: 0.85,
+              filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.25))",
+            }}
+          />
+        )}
+
+        {/* Hint when sig ready but not placed */}
+        {sigPreviewUrl && !sigPos && (
+          <div className="absolute inset-0 flex items-end justify-center pb-4 pointer-events-none">
+            <div className="flex items-center gap-1.5 bg-black/60 text-white text-xs px-3 py-1.5 rounded-full">
+              <Move className="h-3.5 w-3.5" /> Nhấp vào PDF để đặt chữ ký
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── SignTab ──────────────────────────────────────────────────────────────────
 function SignTab() {
-  const [files, setFiles] = useState<File[]>([]);
-  const [signType, setSignType] = useState<"text" | "draw" | "upload">("text");
-  const [signText, setSignText] = useState("");
-  const [done, setDone] = useState(false);
-  const [loading, setLoading] = useState(false);
+  // File state
+  const [pdfFile, setPdfFile]     = useState<File | null>(null);
+  const [pdfFileUrl, setPdfFileUrl] = useState<string | null>(null);
+  const [numPages, setNumPages]   = useState(0);
+  const [viewPage, setViewPage]   = useState(1);
 
-  const process = async () => { setLoading(true); await new Promise((r) => setTimeout(r, 2000)); setLoading(false); setDone(true); };
+  // Signature creation
+  const [signType, setSignType]         = useState<SignType>("text");
+  const [signText, setSignText]         = useState("");
+  const [fontSize, setFontSize]         = useState(48);
+  const [fontColor, setFontColor]       = useState("#1a1a1a");
+  const [uploadedSig, setUploadedSig]   = useState<File | null>(null);
+  const [uploadedSigUrl, setUploadedSigUrl] = useState<string | null>(null);
+  const [hasDrawing, setHasDrawing]     = useState(false);
+  const [sigPreviewUrl, setSigPreviewUrl] = useState<string | null>(null);
 
-  if (done) return (
+  // Placement
+  const [sigPos, setSigPos]       = useState<SigPos | null>(null);
+  const [sigWidth, setSigWidth]   = useState(180);  // PDF points
+  const [signPage, setSignPage]   = useState<string>("last");
+
+  // Container width for responsive scaling
+  const [containerWidth, setContainerWidth] = useState(400);
+
+  // Misc
+  const [loading, setLoading]     = useState(false);
+  const [error, setError]         = useState("");
+  const [done, setDone]           = useState(false);
+  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
+
+  // Draw canvas
+  const canvasRef   = useRef<HTMLCanvasElement>(null);
+  const drawing     = useRef(false);
+  const lastPos     = useRef<{ x: number; y: number } | null>(null);
+
+  // ── Live signature preview generation ──────────────────────────────────────
+  useEffect(() => {
+    if (signType !== "text") return;
+    if (!signText.trim()) { setSigPreviewUrl(null); return; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      const blob = await textToBlob(signText.trim(), fontSize, fontColor);
+      if (!cancelled) {
+        const url = URL.createObjectURL(blob);
+        setSigPreviewUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return url; });
+      }
+    }, 200);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [signType, signText, fontSize, fontColor]);
+
+  useEffect(() => {
+    if (signType !== "upload") return;
+    setSigPreviewUrl(uploadedSigUrl);
+  }, [signType, uploadedSigUrl]);
+
+  // ── Canvas draw helpers ─────────────────────────────────────────────────────
+  const getCanvasPos = (e: React.MouseEvent | React.TouchEvent, canvas: HTMLCanvasElement) => {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    if ("touches" in e) return { x: (e.touches[0].clientX - rect.left) * scaleX, y: (e.touches[0].clientY - rect.top) * scaleY };
+    return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
+  };
+  const startDraw = (e: React.MouseEvent | React.TouchEvent) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    drawing.current = true;
+    lastPos.current = getCanvasPos(e, canvas);
+    e.preventDefault();
+  };
+  const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    if (!drawing.current) return;
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext("2d")!;
+    const pos = getCanvasPos(e, canvas);
+    ctx.beginPath(); ctx.moveTo(lastPos.current!.x, lastPos.current!.y);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.strokeStyle = fontColor; ctx.lineWidth = 2.5;
+    ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.stroke();
+    lastPos.current = pos; setHasDrawing(true); e.preventDefault();
+  };
+  const stopDraw = () => {
+    drawing.current = false; lastPos.current = null;
+    if (signType === "draw" && hasDrawing) {
+      canvasRef.current?.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        setSigPreviewUrl((prev) => { if (prev && signType === "draw") URL.revokeObjectURL(prev); return url; });
+      }, "image/png");
+    }
+  };
+  const clearCanvas = () => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    canvas.getContext("2d")!.clearRect(0, 0, canvas.width, canvas.height);
+    setHasDrawing(false); setSigPreviewUrl(null); setSigPos(null);
+  };
+
+  // ── Computed sig display width (pixels on the rendered PDF page) ──────────
+  const sigDisplayWidth = Math.round((sigWidth / PDF_A4_WIDTH_PT) * containerWidth);
+
+  // ── Handlers ────────────────────────────────────────────────────────────────
+  const handlePdfFiles = (files: File[]) => {
+    if (!files[0]) return;
+    const f = files[0];
+    setPdfFile(f);
+    if (pdfFileUrl) URL.revokeObjectURL(pdfFileUrl);
+    setPdfFileUrl(URL.createObjectURL(f));
+    setSigPos(null); setError("");
+  };
+
+  const handleUploadSig = (files: File[]) => {
+    if (!files.length) return;
+    const f = files[0];
+    setUploadedSig(f);
+    if (uploadedSigUrl) URL.revokeObjectURL(uploadedSigUrl);
+    setUploadedSigUrl(URL.createObjectURL(f));
+  };
+
+  const handleProcess = async () => {
+    if (!pdfFile) { setError("Vui lòng chọn file PDF."); return; }
+    if (!sigPreviewUrl && !(signType === "draw" && hasDrawing)) {
+      setError("Vui lòng tạo chữ ký trước."); return;
+    }
+    if (signType === "text" && !signText.trim()) { setError("Vui lòng nhập nội dung chữ ký."); return; }
+    if (signType === "draw" && !hasDrawing) { setError("Vui lòng vẽ chữ ký."); return; }
+    if (signType === "upload" && !uploadedSig) { setError("Vui lòng tải lên ảnh chữ ký."); return; }
+    if (!sigPos) { setError("Vui lòng nhấp vào vị trí bạn muốn đặt chữ ký trên PDF."); return; }
+    if (signPage !== "last" && signPage !== "first" && signPage !== "all" && (isNaN(Number(signPage)) || Number(signPage) < 1)) {
+      setError("Số trang không hợp lệ."); return;
+    }
+
+    setLoading(true); setError("");
+    try {
+      let sigBlob: Blob;
+      if (signType === "text") {
+        sigBlob = await textToBlob(signText.trim(), fontSize, fontColor);
+      } else if (signType === "draw") {
+        sigBlob = await new Promise<Blob>((res, rej) =>
+          canvasRef.current!.toBlob((b) => b ? res(b) : rej(new Error("canvas empty")), "image/png")
+        );
+      } else {
+        sigBlob = uploadedSig!;
+      }
+
+      const pageVal = (signPage === "last" || signPage === "first" || signPage === "all")
+        ? signPage : Number(signPage);
+
+      const blob = await signPdf(pdfFile, sigBlob, {
+        page: pageVal as "last" | "first" | "all",
+        position: "custom",
+        xPct: sigPos.xPct,
+        yPct: sigPos.yPct,
+        anchorFromTop: true,
+        sigWidth,
+      });
+      setResultBlob(blob); setDone(true);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Ký thất bại, vui lòng thử lại.");
+    } finally { setLoading(false); }
+  };
+
+  const handleDownload = () => {
+    if (!resultBlob || !pdfFile) return;
+    downloadBlob(resultBlob, pdfFile.name.replace(/\.pdf$/i, "") + "-signed.pdf");
+  };
+
+  const handleReset = () => {
+    setPdfFile(null);
+    if (pdfFileUrl) URL.revokeObjectURL(pdfFileUrl); setPdfFileUrl(null);
+    setSignText(""); setUploadedSig(null);
+    if (uploadedSigUrl) URL.revokeObjectURL(uploadedSigUrl); setUploadedSigUrl(null);
+    setSigPreviewUrl(null); setSigPos(null);
+    setResultBlob(null); setDone(false); setError("");
+    setHasDrawing(false); setNumPages(0); setViewPage(1);
+    clearCanvas();
+  };
+
+  // ── Done screen ─────────────────────────────────────────────────────────────
+  if (done && resultBlob) return (
     <div className="flex flex-col items-center gap-4 py-10">
       <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center">
         <CheckCircle className="h-8 w-8 text-green-500" />
       </div>
       <p className="text-lg font-bold text-gray-900">Ký thành công!</p>
-      <div className="flex gap-3">
-        <Button size="lg"><Download className="h-4 w-4" /> Tải PDF đã ký</Button>
-        <Button variant="secondary" onClick={() => { setDone(false); setFiles([]); setSignText(""); }}>Ký mới</Button>
+      <p className="text-sm text-gray-500">File PDF đã được nhúng chữ ký.</p>
+      <div className="flex gap-3 flex-wrap justify-center">
+        <Button size="lg" onClick={handleDownload}><Download className="h-4 w-4" /> Tải PDF đã ký</Button>
+        <Button variant="secondary" onClick={handleReset}><RotateCcw className="h-4 w-4" /> Ký file mới</Button>
       </div>
     </div>
   );
 
+  // ── Upload screen ───────────────────────────────────────────────────────────
+  if (!pdfFile) return (
+    <UploadBox
+      accept=".pdf"
+      onFilesChange={handlePdfFiles}
+      maxSize={50}
+      label="Kéo thả file PDF cần ký"
+      description="Hỗ trợ PDF · Tối đa 50MB"
+    />
+  );
+
+  // ── Main editing layout ──────────────────────────────────────────────────────
   return (
-    <div className="space-y-5">
-      <UploadBox accept=".pdf" onFilesChange={setFiles} maxSize={50} label="Kéo thả file PDF cần ký" />
-      {files.length > 0 && (
-        <>
+    <div className="space-y-4">
+      {/* PDF file info row */}
+      <div className="flex items-center gap-3 p-3 rounded-xl border border-gray-200 bg-gray-50">
+        <div className="w-9 h-9 bg-orange-100 rounded-lg flex items-center justify-center shrink-0">
+          <FileText className="h-5 w-5 text-[#ff7a18]" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-gray-800 truncate">{pdfFile.name}</p>
+          <p className="text-xs text-gray-400">
+            {(pdfFile.size / 1024 / 1024).toFixed(2)} MB
+            {numPages > 0 && ` · ${numPages} trang`}
+          </p>
+        </div>
+        <button onClick={handleReset}
+          className="p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      {/* Two column layout */}
+      <div className="grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-5">
+
+        {/* ── Left: Signature controls ── */}
+        <div className="space-y-4">
+          {/* Sig type tabs */}
           <div>
-            <p className="text-sm font-semibold text-gray-700 mb-3">Kiểu chữ ký:</p>
-            <div className="grid grid-cols-3 gap-3">
-              {[{ id: "text", label: "Nhập text" }, { id: "draw", label: "Vẽ tay" }, { id: "upload", label: "Tải ảnh" }].map((t) => (
-                <button key={t.id} onClick={() => setSignType(t.id as "text" | "draw" | "upload")}
-                  className={cn("py-3 px-4 rounded-xl border text-sm font-medium transition-all",
-                    signType === t.id ? "border-[#ff7a18] bg-orange-50 text-[#ff7a18]" : "border-gray-200 text-gray-600 hover:border-gray-300")}>
-                  {t.label}
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Kiểu chữ ký</p>
+            <div className="grid grid-cols-3 gap-1.5">
+              {([
+                { id: "text",   label: "Text",    desc: "Nhập tên" },
+                { id: "draw",   label: "Vẽ tay",  desc: "Ký tay" },
+                { id: "upload", label: "Tải lên", desc: "Ảnh PNG" },
+              ] as { id: SignType; label: string; desc: string }[]).map((t) => (
+                <button key={t.id} onClick={() => { setSignType(t.id); setError(""); setSigPos(null); setSigPreviewUrl(null); }}
+                  className={cn("py-2.5 px-2 rounded-xl border text-center transition-all",
+                    signType === t.id
+                      ? "border-[#ff7a18] bg-orange-50 text-[#ff7a18]"
+                      : "border-gray-200 text-gray-600 hover:border-gray-300")}>
+                  <span className="block text-xs font-semibold">{t.label}</span>
+                  <span className="block text-[10px] opacity-60 mt-0.5">{t.desc}</span>
                 </button>
               ))}
             </div>
           </div>
+
+          {/* Text signature */}
           {signType === "text" && (
-            <div>
-              <label className="text-sm font-medium text-gray-700 block mb-1.5">Tên/chữ ký</label>
-              <input type="text" placeholder="Nhập tên hoặc chữ ký..." value={signText}
-                onChange={(e) => setSignText(e.target.value)}
-                className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#ff7a18]/30 focus:border-[#ff7a18] transition-all" />
+            <div className="space-y-3">
+              <input type="text" placeholder="Nguyễn Văn A" value={signText}
+                onChange={(e) => { setSignText(e.target.value); setError(""); setSigPos(null); }}
+                className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#ff7a18]/30 focus:border-[#ff7a18]" />
+              <div className="flex gap-3 items-end">
+                <div className="flex-1">
+                  <label className="text-[10px] font-semibold text-gray-500 block mb-1">Cỡ: {fontSize}px</label>
+                  <input type="range" min={24} max={96} step={4} value={fontSize}
+                    onChange={(e) => { setFontSize(Number(e.target.value)); setSigPos(null); }}
+                    className="w-full accent-[#ff7a18]" />
+                </div>
+                <div>
+                  <label className="text-[10px] font-semibold text-gray-500 block mb-1">Màu</label>
+                  <input type="color" value={fontColor}
+                    onChange={(e) => { setFontColor(e.target.value); setSigPos(null); }}
+                    className="h-8 w-12 rounded-lg border border-gray-200 cursor-pointer p-0.5" />
+                </div>
+              </div>
               {signText && (
-                <div className="mt-3 p-4 bg-gray-50 rounded-xl border border-gray-100 text-center">
-                  <span className="text-2xl text-gray-700">{signText}</span>
+                <div className="p-3 bg-gray-50 rounded-xl border border-gray-100 text-center overflow-hidden">
+                  <span style={{ fontSize: Math.min(fontSize * 0.6, 32), color: fontColor, fontStyle: "italic", fontFamily: "'Brush Script MT', cursive" }}>
+                    {signText}
+                  </span>
                 </div>
               )}
             </div>
           )}
+
+          {/* Draw signature */}
           {signType === "draw" && (
-            <div className="p-4 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200 text-center h-32 flex items-center justify-center">
-              <p className="text-sm text-gray-400">Canvas vẽ tay (chức năng sắp ra mắt)</p>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold text-gray-600">Vẽ chữ ký</label>
+                <div className="flex items-center gap-2">
+                  <input type="color" value={fontColor} onChange={(e) => setFontColor(e.target.value)}
+                    className="h-6 w-9 rounded border border-gray-200 cursor-pointer p-0.5" />
+                  <button onClick={clearCanvas}
+                    className="flex items-center gap-1 text-xs text-gray-500 hover:text-red-500 px-2 py-1 rounded-lg hover:bg-red-50 border border-gray-200 transition-colors">
+                    <Trash2 className="h-3 w-3" /> Xóa
+                  </button>
+                </div>
+              </div>
+              <canvas ref={canvasRef} width={600} height={150}
+                className="w-full rounded-xl border-2 border-dashed border-gray-300 bg-white cursor-crosshair touch-none"
+                style={{ maxHeight: 130 }}
+                onMouseDown={startDraw} onMouseMove={draw} onMouseUp={stopDraw} onMouseLeave={stopDraw}
+                onTouchStart={startDraw} onTouchMove={draw} onTouchEnd={stopDraw} />
+              {!hasDrawing && <p className="text-[11px] text-gray-400 text-center">Nhấn giữ và kéo để vẽ</p>}
             </div>
           )}
-          {signType === "upload" && <UploadBox accept=".png,.jpg" label="Tải ảnh chữ ký (nền trong suốt)" />}
-          <Button size="lg" onClick={process} loading={loading} disabled={signType === "text" && !signText} fullWidth>
-            <PenTool className="h-4 w-4" /> Ký vào PDF
-          </Button>
-        </>
+
+          {/* Upload signature */}
+          {signType === "upload" && (
+            <div className="space-y-2">
+              {!uploadedSigUrl ? (
+                <UploadBox accept=".png,.jpg,.jpeg,.webp" onFilesChange={handleUploadSig} maxSize={5}
+                  label="Tải ảnh chữ ký" description="PNG nền trong suốt tốt nhất · ≤ 5MB" />
+              ) : (
+                <div className="flex items-center gap-3 p-3 rounded-xl border border-green-200 bg-green-50">
+                  <img src={uploadedSigUrl} alt="sig" className="h-12 max-w-[140px] object-contain rounded" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-medium text-gray-700 truncate">{uploadedSig?.name}</p>
+                  </div>
+                  <button onClick={() => { setUploadedSig(null); if (uploadedSigUrl) URL.revokeObjectURL(uploadedSigUrl); setUploadedSigUrl(null); setSigPreviewUrl(null); setSigPos(null); }}
+                    className="p-1.5 text-gray-400 hover:text-red-500 rounded-lg transition-colors">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Sig size */}
+          <div>
+            <label className="text-xs font-semibold text-gray-600 block mb-1">
+              Kích thước: <span className="text-[#ff7a18]">{sigWidth}pt</span>
+            </label>
+            <input type="range" min={60} max={400} step={10} value={sigWidth}
+              onChange={(e) => { setSigWidth(Number(e.target.value)); setSigPos(null); }}
+              className="w-full accent-[#ff7a18]" />
+            <div className="flex justify-between text-[10px] text-gray-400 mt-0.5"><span>Nhỏ</span><span>Lớn</span></div>
+          </div>
+
+          {/* Page to sign */}
+          <div>
+            <label className="text-xs font-semibold text-gray-600 block mb-1.5">Ký vào trang</label>
+            <select value={signPage} onChange={(e) => setSignPage(e.target.value)}
+              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#ff7a18]/30 focus:border-[#ff7a18]">
+              <option value="last">Trang cuối</option>
+              <option value="first">Trang đầu</option>
+              <option value="all">Tất cả trang</option>
+              {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => (
+                <option key={n} value={String(n)}>Trang {n}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Sig preview badge */}
+          {sigPreviewUrl && !sigPos && (
+            <div className="flex items-center gap-2 px-3 py-2 bg-blue-50 border border-blue-200 rounded-xl text-xs text-blue-700">
+              <Move className="h-3.5 w-3.5 shrink-0" />
+              <span>Nhấp vào PDF bên phải để đặt chữ ký</span>
+            </div>
+          )}
+          {sigPos && (
+            <div className="flex items-center justify-between px-3 py-2 bg-green-50 border border-green-200 rounded-xl text-xs text-green-700">
+              <span>✓ Đã đặt vị trí chữ ký</span>
+              <button onClick={() => setSigPos(null)} className="underline text-green-600 hover:text-green-800">Đặt lại</button>
+            </div>
+          )}
+        </div>
+
+        {/* ── Right: PDF viewer ── */}
+        <div className="min-w-0">
+          {pdfFileUrl && (
+            <PdfSignViewer
+              fileUrl={pdfFileUrl}
+              numPages={numPages}
+              viewPage={viewPage}
+              onPageChange={(p) => {
+                setViewPage(p);
+                setSignPage(String(p));
+              }}
+              sigPreviewUrl={sigPreviewUrl}
+              sigPos={sigPos}
+              onSigMove={(pos) => {
+                setSigPos(pos);
+                // Sync view page to sign page
+                if (signPage !== "all" && signPage !== "first" && signPage !== "last") {
+                  setSignPage(String(viewPage));
+                }
+              }}
+              sigDisplayWidth={sigDisplayWidth}
+              containerWidth={containerWidth}
+              onContainerWidth={setContainerWidth}
+            />
+          )}
+          <Document file={pdfFileUrl!} onLoadSuccess={({ numPages: n }) => { setNumPages(n); }} className="hidden" />
+        </div>
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div className="flex items-center gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-600">
+          <AlertCircle className="h-4 w-4 shrink-0" /> {error}
+        </div>
       )}
+
+      {/* Submit */}
+      <Button size="lg" onClick={handleProcess} loading={loading} fullWidth
+        disabled={loading || !sigPos || !pdfFile}>
+        {loading
+          ? <><Loader2 className="h-4 w-4 animate-spin" /> Đang ký PDF...</>
+          : <><PenTool className="h-4 w-4" /> Ký vào PDF</>}
+      </Button>
     </div>
   );
 }
@@ -408,7 +937,7 @@ function PDFToolsContent() {
 
   return (
     <AppLayout user={appUser}>
-      <div className="max-w-3xl mx-auto space-y-6">
+      <div className={cn("mx-auto space-y-6", activeTab === "sign" ? "max-w-5xl" : "max-w-3xl")}>
         <div>
           <div className="flex items-center gap-3 mb-1">
             <div className="w-9 h-9 bg-gradient-to-br from-[#ff7a18] to-amber-500 rounded-xl flex items-center justify-center">
